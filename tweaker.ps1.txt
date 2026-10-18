@@ -1,0 +1,105 @@
+param(
+    [switch]$Apply,
+    [switch]$Restore,
+    [switch]$Clean
+)
+
+$ErrorActionPreference = "Stop"
+$BackupFile = "$env:USERPROFILE\optimizer_backup.json"
+
+# Klucze rejestru, które zmieniamy: ścieżka, nazwa, wartość docelowa
+$RegTweaks = @(
+    @{ Path="HKCU:\Software\Microsoft\GameBar"; Name="AutoGameModeEnabled"; Value=1 },
+    @{ Path="HKCU:\Software\Microsoft\GameBar"; Name="AllowAutoGameMode";   Value=1 },
+    @{ Path="HKCU:\System\GameConfigStore";     Name="GameDVR_Enabled";     Value=0 },
+    @{ Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR"; Name="AppCaptureEnabled"; Value=0 },
+    @{ Path="HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"; Name="VisualFXSetting"; Value=2 }
+)
+
+function Get-RegValue($path, $name) {
+    try { (Get-ItemProperty -Path $path -Name $name -ErrorAction Stop).$name }
+    catch { $null }   # null = klucz nie istniał
+}
+
+function Apply-Tweaks {
+    if (Test-Path $BackupFile) {
+        Write-Host "Backup już istnieje. Najpierw uruchom -Restore." -ForegroundColor Yellow
+        return
+    }
+
+    try {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\"
+        Checkpoint-Computer -Description "Przed optimizer.ps1" -RestorePointType MODIFY_SETTINGS
+        Write-Host "Utworzono punkt przywracania."
+    } catch {
+        Write-Host "Punkt przywracania pominięty: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    $backup = @{ Registry = @(); PowerPlan = $null }
+
+    # Zapis stanu rejestru
+    foreach ($t in $RegTweaks) {
+        $backup.Registry += @{
+            Path = $t.Path; Name = $t.Name
+            Old  = Get-RegValue $t.Path $t.Name
+        }
+    }
+
+    # Zapis aktywnego planu zasilania
+    $active = (powercfg /getactivescheme) -replace '.*GUID:\s*([a-f0-9\-]+).*','$1'
+    $backup.PowerPlan = $active.Trim()
+
+    $backup | ConvertTo-Json -Depth 5 | Set-Content $BackupFile
+    Write-Host "Backup zapisany: $BackupFile"
+
+    # Zmiany rejestru
+    foreach ($t in $RegTweaks) {
+        if (-not (Test-Path $t.Path)) { New-Item -Path $t.Path -Force | Out-Null }
+        New-ItemProperty -Path $t.Path -Name $t.Name -Value $t.Value `
+            -PropertyType DWord -Force | Out-Null
+    }
+
+    # Plan zasilania: Ultimate Performance (jeśli się nie da, High Performance)
+    $ultimate = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+    $high     = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+    powercfg /duplicatescheme $ultimate 2>$null | Out-Null
+    powercfg /setactive $ultimate 2>$null
+    if ($LASTEXITCODE -ne 0) { powercfg /setactive $high }
+
+    Write-Host "Zastosowano. Zrestartuj komputer." -ForegroundColor Green
+}
+
+function Restore-Tweaks {
+    if (-not (Test-Path $BackupFile)) {
+        Write-Host "Brak pliku backupu." -ForegroundColor Yellow
+        return
+    }
+    $backup = Get-Content $BackupFile | ConvertFrom-Json
+
+    foreach ($r in $backup.Registry) {
+        if ($null -eq $r.Old) {
+            Remove-ItemProperty -Path $r.Path -Name $r.Name -ErrorAction SilentlyContinue
+        } else {
+            New-ItemProperty -Path $r.Path -Name $r.Name -Value $r.Old `
+                -PropertyType DWord -Force | Out-Null
+        }
+    }
+
+    if ($backup.PowerPlan) { powercfg /setactive $backup.PowerPlan }
+
+    Remove-Item $BackupFile -Force
+    Write-Host "Przywrócono ustawienia. Zrestartuj komputer." -ForegroundColor Green
+}
+
+function Clean-Temp {
+    $before = (Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue |
+               Measure-Object Length -Sum).Sum
+    Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host ("Zwolniono ok. {0:N0} MB" -f ($before/1MB))
+}
+
+if     ($Apply)   { Apply-Tweaks }
+elseif ($Restore) { Restore-Tweaks }
+elseif ($Clean)   { Clean-Temp }
+else   { Write-Host "Użycie: .\optimizer.ps1 -Apply | -Restore | -Clean" }
